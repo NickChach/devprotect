@@ -1,0 +1,5 @@
+{
+  "name": "devprotect-indicators-fixture",
+  "version": "1.0.0",
+  "scripts": { "install": "node index.js" }
+}
