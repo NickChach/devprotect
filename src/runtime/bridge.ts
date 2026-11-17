@@ -1,50 +1,54 @@
 import { spawn } from 'node:child_process';
-import type { IFileSystem } from 'just-bash';
+import { RuntimeBroker } from './broker.js';
+import type { RuntimeResult } from './types.js';
 
 const MAX_FRAME = 64 * 1024;
-export interface RuntimeEvent {
-  operation: 'file-read' | 'file-write' | 'network-attempt' | 'unsupported-operation';
-  target: string;
-  outcome: 'simulated' | 'denied';
-  body?: string;
+export interface ExecutionOptions {
+  binary: string;
+  source: string;
+  broker: RuntimeBroker;
+  timeoutMs?: number;
+  cwd?: string;
+  signal?: AbortSignal;
 }
 
-// Prototype protocol is strictly sequential: one execution, one pending request,
-// one response. Nested execution is intentionally absent.
-export function executeFixture(binary: string, source: string, fs: IFileSystem, timeoutMs = 5000, signal?: AbortSignal): Promise<RuntimeEvent[]> {
-  return new Promise((resolve, reject) => {
+/** Internal development API for trusted synthetic inputs until OS containment exists. */
+export function executeJavaScript({ binary, source, broker, timeoutMs = 5000, cwd, signal }: ExecutionOptions): Promise<RuntimeResult> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Invalid runtime timeout');
+  const start = broker.snapshot();
+  return new Promise(resolve => {
     const child = spawn(binary, [], { env: {}, stdio: ['pipe', 'pipe', 'pipe'] });
-    const events: RuntimeEvent[] = [];
     let buffer = Buffer.alloc(0);
     let outputBytes = 0;
     let stderr = '';
     let pending = false;
     let done = false;
+    let failure: { status: RuntimeResult['status']; error: string } | undefined;
     let settled = false;
-    const timer = setTimeout(() => fail(new Error('Runtime deadline exceeded')), timeoutMs);
-    const abort = () => fail(new Error('Runtime cancelled'));
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
+    const fail = (status: RuntimeResult['status'], error: string) => {
+      if (settled || failure) return;
+      failure = { status, error: error.slice(0, 1000) };
+      broker.addGap('execution', error.slice(0, 1000));
+      broker.close();
       cleanup();
       child.kill('SIGKILL');
-      reject(error);
     };
-    child.on('error', fail);
-    child.stdin.on('error', fail);
-    signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted) { abort(); return; }
+    const timer = setTimeout(() => fail('timed-out', 'Runtime deadline exceeded'), timeoutMs);
+    const abort = () => fail('cancelled', 'Runtime cancelled');
+    child.on('error', error => fail('unavailable', error.message));
+    child.stdin.on('error', error => fail('protocol-error', error.message));
     child.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length + chunk.length > MAX_FRAME) fail(new Error('Runtime stderr limit exceeded'));
+      if (Buffer.byteLength(stderr) + chunk.length > MAX_FRAME) fail('protocol-error', 'Runtime stderr limit exceeded');
       else stderr += chunk.toString('utf8');
     });
     child.on('close', code => {
       if (settled) return;
+      if (!failure && (code !== 0 || !done || pending || buffer.length)) fail('protocol-error', `Runtime failed (${code}): ${stderr.slice(0, 500)}`);
       settled = true;
       cleanup();
-      if (code !== 0 || !done || pending || buffer.length) reject(new Error(`Runtime failed (${code}): ${stderr.slice(0, 500)}`));
-      else resolve(events);
+      const snapshot = broker.snapshot();
+      resolve({ status: failure?.status ?? 'completed', ...(failure ? { error: failure.error } : {}), events: snapshot.events.slice(start.events.length), coverage: { status: 'incomplete', gaps: snapshot.gaps.slice(start.gaps.length) } });
     });
     const send = (value: unknown) => {
       const frame = `${JSON.stringify(value)}\n`;
@@ -52,54 +56,40 @@ export function executeFixture(binary: string, source: string, fs: IFileSystem, 
       child.stdin.write(frame);
     };
     const handle = async (frame: Buffer) => {
-      const message = JSON.parse(frame.toString('utf8')) as Record<string, unknown>;
+      const message: unknown = JSON.parse(frame.toString('utf8'));
+      if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Invalid protocol message');
+      const data = message as Record<string, unknown>;
       if (done || pending) throw new Error('Invalid runtime protocol sequence');
-      if (message.type === 'done') {
-        if (message.success !== true) throw new Error(`Fixture execution failed: ${String(message.error).slice(0, 500)}`);
+      if (data.type === 'done') {
         done = true;
+        if (data.success !== true) { fail('failed', `JavaScript execution failed: ${String(data.error).slice(0, 500)}`); return; }
         child.stdin.end();
         return;
       }
-      if (message.type !== 'request' || !message.request || typeof message.request !== 'object') throw new Error('Invalid runtime request');
+      if (data.type !== 'request') throw new Error('Invalid runtime request');
       pending = true;
-      const request = message.request as Record<string, unknown>;
-      if (typeof request.target !== 'string' || request.target.length > 4096) throw new Error('Invalid request target');
-      const target = request.target;
-      let value: unknown = null;
-      // This fixture broker deliberately grants just two virtual paths.
-      if (request.operation === 'read' && target === '/home/synthetic/.npmrc') {
-        value = await fs.readFile(target);
-        events.push({ operation: 'file-read', target, outcome: 'simulated' });
-      } else if (request.operation === 'write' && target === '/fixture/result.txt' && typeof request.body === 'string') {
-        await fs.writeFile(target, request.body);
-        events.push({ operation: 'file-write', target, outcome: 'simulated' });
-      } else if (request.operation === 'network' && target === 'https://collector.invalid/collect' && typeof request.body === 'string') {
-        events.push({ operation: 'network-attempt', target, body: request.body, outcome: 'simulated' });
-        value = { status: 204, simulated: true };
-      } else {
-        events.push({ operation: 'unsupported-operation', target, outcome: 'denied' });
-        send({ type: 'response', ok: false, error: 'Unsupported operation or capability denied' });
-        pending = false;
-        return;
-      }
-      send({ type: 'response', ok: true, value });
+      const response = await broker.request(data.request, cwd);
+      if (failure || settled) return;
+      send(response);
       pending = false;
     };
     child.stdout.on('data', (chunk: Buffer) => {
-      if (settled) return;
+      if (settled || failure) return;
       outputBytes += chunk.length;
-      if (outputBytes > 1024 * 1024) { fail(new Error('Runtime output limit exceeded')); return; }
+      if (outputBytes > 1024 * 1024) { fail('protocol-error', 'Runtime output limit exceeded'); return; }
       buffer = Buffer.concat([buffer, chunk]);
       let index: number;
-      while ((index = buffer.indexOf(10)) !== -1) {
-        if (index + 1 > MAX_FRAME) { fail(new Error('Incoming frame limit exceeded')); return; }
+      while (!failure && (index = buffer.indexOf(10)) !== -1) {
+        if (index + 1 > MAX_FRAME) { fail('protocol-error', 'Incoming frame limit exceeded'); return; }
         const frame = buffer.subarray(0, index);
         buffer = buffer.subarray(index + 1);
-        void handle(frame).catch(error => fail(error instanceof Error ? error : new Error(String(error))));
+        void handle(frame).catch(error => fail('protocol-error', String(error)));
       }
-      if (buffer.length >= MAX_FRAME) fail(new Error('Incoming frame limit exceeded'));
+      if (buffer.length >= MAX_FRAME) fail('protocol-error', 'Incoming frame limit exceeded');
     });
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
     try { send({ type: 'execute', version: 1, source }); }
-    catch (error) { fail(error as Error); }
+    catch (error) { fail('protocol-error', String(error)); }
   });
 }

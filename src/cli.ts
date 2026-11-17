@@ -8,6 +8,7 @@ const HELP = `DevProtect — initial implementation
 Usage:
   devprotect scan <package-directory> [--json]
   devprotect runtime-demo [--json]
+  devprotect runtime-fixtures [--json]
 
 scan performs local static inspection only. Coverage is always incomplete.
 runtime-demo runs only the built-in synthetic fixture; it does not accept package code.
@@ -27,6 +28,12 @@ async function main(): Promise<void> {
     const { runDemo } = await import('./runtime/demo.js');
     const result = await runDemo();
     console.log(JSON.stringify(result, null, 2));
+    if (result.status !== 'completed') process.exitCode = 1;
+  } else if (command === 'runtime-fixtures' && args.positionals.length === 1) {
+    const { runFixture, FIXTURES } = await import('./runtime/demo.js');
+    const results: Record<string, unknown> = {};
+    for (const name of Object.keys(FIXTURES) as (keyof typeof FIXTURES)[]) results[name] = await runFixture(name);
+    console.log(JSON.stringify(results, null, 2));
   } else { console.error(HELP); process.exitCode = 2; }
 }
 

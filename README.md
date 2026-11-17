@@ -51,37 +51,50 @@ cargo test --locked --manifest-path runtime/Cargo.toml
 cargo clippy --locked --manifest-path runtime/Cargo.toml --all-targets -- -D warnings
 ```
 
-The demo executes one built-in synthetic fixture:
+The demo runs a credential fixture through the reusable session API: just-bash
+writes a synthetic token, V8 reads it synchronously, the broker records a
+simulated request, and the shell reads a JavaScript-created file. To run all
+built-in fixtures:
 
-1. just-bash writes `DEVPROTECT_FAKE_TOKEN` to its in-memory filesystem.
-2. A custom `node` command launches the separate Rust/V8 worker.
-3. JavaScript synchronously reads that same virtual file through the broker.
-4. The broker records a simulated request containing the fake token and returns
-   a synthetic HTTP 204 response. It performs no network request.
-5. JavaScript writes another virtual file, which just-bash then reads.
+```sh
+node dist/cli.js runtime-fixtures --json
+```
 
-The output includes both checks and the coordinator-recorded events. The demo
-uses tiny fixture APIs; there is no `require`, Node module loader, asynchronous
-event loop, or actual package lifecycle replay. Guest stdout cannot create
-security events. The worker inherits an empty environment; protocol frames,
-output, execution time, and V8 heap size have limits. The supervisor supports
-deadline termination and cancellation.
+The fixture suite covers credential access, a file transformation, failure after
+a read, and caught denied/unsupported operations. A deliberately failing fixture
+returns `status: "failed"`; its preceding events remain available.
 
-**OS containment is not implemented.** The CLI therefore exposes only the fixed
-demo, with no option for running target package code. The worker binary and
-internal bridge are development tools, not a secure service for arbitrary code.
-V8 native artifact verification, OS resource limits, general Node compatibility,
-and nested execution remain future work.
+The runtime accepts a caller-supplied virtual filesystem, capability policy,
+simulated network responses, cwd/environment, timeout, and cancellation signal.
+`src/runtime/session.ts` exports `runSyntheticSession`; `bridge.ts` exports the
+lower-level `executeJavaScript`. These internal APIs accept trusted fixtures.
+The CLI has no option to execute user-supplied package code.
+
+The broker applies read/write directory grants to shell and JavaScript operations.
+It logs ordered events with shell, JavaScript, or loader attribution. It blocks
+virtual symlinks and unsupported filesystem operations. Caught capability denials
+and unsupported requests remain coverage gaps. Network responses are configured
+simulation data, with no real outgoing requests. Guest code exposes only tiny
+synchronous fixture wrappers; there is no Node module loader or event loop.
+
+Executions return structured completed/failed/timed-out/cancelled/protocol-error/
+unavailable results, retaining events on failure. Sessions enforce a shared
+deadline and revoke capabilities on teardown. See the protocol document for
+supported operations, bootstrap behavior and event limits.
+
+**OS containment is not implemented.** The worker binary and internal APIs remain
+development tools for synthetic inputs. V8 artifact verification, process resource
+limits, Node compatibility, and lifecycle replay remain future work.
 
 Native integration tests are explicitly skipped until the Rust binary exists.
-Build it before running `npm test` to exercise the complete initial test suite.
+Build it before running `npm test` to exercise the complete test suite.
 
 ## Implementation structure
 
 - `src/scan.ts`: bounded local inventory and scan coordination.
 - `src/analyze.ts`: initial static rules and AST traversal.
 - `src/model.ts`, `src/report.ts`: report contract and terminal-safe rendering.
-- `src/runtime/`: fixture broker and just-bash integration.
+- `src/runtime/`: capability broker, worker supervisor, reusable sessions, result types, and built-in fixtures.
 - `runtime/`: Rust/V8 worker and bounded protocol reader.
 - `docs/runtime-protocol.md`: provisional ownership and protocol decisions.
 - `tests/`, `fixtures/`: scanner and runtime validation.
